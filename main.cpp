@@ -1,29 +1,29 @@
 // main.cpp
 // Created by Francesco on 17/02/2026.
 //
-// Test minimale del simulatore FPP tick-based.
+// Entry point: test del simulatore real-time FPP con output esteso.
 
 #include <iostream>
+#include <vector>
+
 #include "include/simulator.hpp"
 
 int main() {
-
     using namespace rt;
 
     std::vector<Task> tasks = {
         {0, 5, 5, 2, 1, 0},  // id, T, D, C, priority, offset
-        {1, 7, 7, 3, 0, 0}   // task 1 ha priorità più alta (0 < 1)
+        {1, 7, 7, 3, 0, 0}
     };
 
-    for (auto& t : tasks) {
-        t.validate();
-    }
+    tick_t horizon = 30;
 
-    Simulator sim(tasks, 30);
-    sim.run(true);
+    Simulator sim(tasks, horizon);
 
-    std::cout << "\nDeadline miss: " << sim.deadline_miss() << "\n";
-    std::cout << "Utilization: " << sim.utilization() << "\n";
+    bool debug_timeline = true;   // metti false se vuoi output più corto
+    bool print_input = true;
+
+    sim.run(debug_timeline, print_input);
 
     return 0;
 }
