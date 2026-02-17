@@ -4,7 +4,7 @@
 // Test minimale del simulatore FPP tick-based.
 
 #include <iostream>
-#include "simulator.hpp"
+#include "include/simulator.hpp"
 
 int main() {
 

@@ -1,8 +1,7 @@
 // scheduler.hpp
 // Created by Francesco on 17/02/2026.
 //
-// Selezione del job da eseguire secondo politica
-// Fixed Priority Preemptive (FPP).
+// Selezione del job da eseguire secondo politica Fixed Priority Preemptive (FPP).
 // Priorità numerica più PICCOLA = priorità più ALTA.
 
 #pragma once
@@ -17,8 +16,6 @@ namespace rt {
 
     class SchedulerFPP {
     public:
-        // Restituisce l'indice del job selezionato in jobs,
-        // oppure -1 se nessun job è pronto.
         static int select_job(const std::vector<Job>& jobs,
                               const std::vector<Task>& tasks,
                               tick_t now)
@@ -28,17 +25,14 @@ namespace rt {
 
             for (size_t i = 0; i < jobs.size(); ++i) {
                 const Job& job = jobs[i];
-
                 if (!job.is_ready(now)) continue;
 
-                const Task& task = tasks[job.task_id];
-
+                const Task& task = tasks.at(job.task_index); // safe
                 if (task.priority < best_priority) {
                     best_priority = task.priority;
                     selected_index = static_cast<int>(i);
                 }
             }
-
             return selected_index;
         }
     };
