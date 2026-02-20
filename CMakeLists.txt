@@ -8,4 +8,7 @@ add_executable(Task_set_simulator_PP_Lab3 main.cpp
         include/job.hpp
         include/scheduler.hpp
         include/simulator.hpp
-        include/metrics.hpp)
+        include/metrics.hpp
+        include/time_utils.hpp
+        include/csv_export.hpp
+        include/batch_runner.hpp)
