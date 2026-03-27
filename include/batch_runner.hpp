@@ -2,7 +2,8 @@
 // Created by Francesco on 17/02/2026.
 //
 // Esecuzione batch (sequenziale) di più task set.
-// Calcola automaticamente l'horizon (fisso o iperperiodo) e salva i risultati su CSV.
+// Supporta horizon fisso o iperperiodo, limite massimo all'horizon,
+// export CSV e progresso sintetico con stima ETA.
 
 #pragma once
 
@@ -10,73 +11,42 @@
 #include <string>
 #include <cstdint>
 #include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <algorithm>
+#include <stdexcept>
 
 #include "task.hpp"
 #include "simulator.hpp"
 #include "time_utils.hpp"
 #include "csv_export.hpp"
-#include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <algorithm>
 
 namespace rt {
 
-    enum class HorizonMode {
-        Fixed,
-        Hyperperiod
-    };
+enum class HorizonMode {
+    Fixed,
+    Hyperperiod
+};
 
-    struct BatchConfig {
-        HorizonMode horizon_mode = HorizonMode::Fixed;
-        tick_t fixed_horizon = 1000;
+struct BatchConfig {
+    HorizonMode horizon_mode = HorizonMode::Fixed;
+    tick_t fixed_horizon = 1000;
 
-        // 0 = nessun limite; se > 0 limita l'horizon massimo
-        tick_t max_horizon = 0;
+    // 0 = nessun limite; se > 0 limita l'horizon massimo
+    tick_t max_horizon = 0;
 
-        bool debug_timeline = false;
-        bool print_input_each_run = false;
-        bool print_summary_each_run = false;
-        bool print_progress = true;
+    bool debug_timeline = false;
+    bool print_input_each_run = false;
+    bool print_summary_each_run = false;
+    bool print_progress = true;
 
-        // aggiorna la riga di progresso ogni N run
-        std::size_t progress_every_runs = 1;
-    };
+    // Stampa il progresso ogni N run completate
+    std::size_t progress_every_runs = 1;
+};
 
-    class BatchRunner {
-    public:
-        static void run(const std::vector<std::vector<Task>>& tasksets,
-                        const BatchConfig& cfg,
-                        const std::string& summary_csv_path,
-                        const std::string& per_task_csv_path)
-        {
-            std::int64_t run_id = 0;
-
-            for (const auto& tasks : tasksets) {
-                tick_t horizon = cfg.fixed_horizon;
-
-                if (cfg.horizon_mode == HorizonMode::Hyperperiod) {
-                    horizon = hyperperiod(tasks);
-                }
-
-                Simulator sim(tasks, horizon);
-                sim.run(cfg.debug_timeline, cfg.print_input_each_run);
-
-                // Salvataggio CSV
-                append_summary_csv(summary_csv_path, run_id, tasks, sim.metrics(), "FPP");
-                append_per_task_csv(per_task_csv_path, run_id, tasks, sim.metrics(), "FPP");
-
-                if (cfg.print_progress) {
-                    std::cout << "[Batch] Completed run_id=" << run_id
-                              << " (n_tasks=" << tasks.size()
-                              << ", horizon=" << horizon << ")\n";
-                }
-                run_id++;
-            }
-        }
-    };
-
-    private:
+class BatchRunner {
+private:
     static tick_t resolve_horizon(const std::vector<Task>& tasks, const BatchConfig& cfg) {
         tick_t horizon = cfg.fixed_horizon;
 
@@ -100,18 +70,24 @@ namespace rt {
     }
 
     static std::string format_seconds(double seconds) {
-        if (seconds < 0.0) seconds = 0.0;
+        if (seconds < 0.0) {
+            seconds = 0.0;
+        }
 
         auto total = static_cast<long long>(seconds + 0.5);
-        const long long h = total / 3600;
+        const long long hours = total / 3600;
         total %= 3600;
-        const long long m = total / 60;
-        const long long s = total % 60;
+        const long long minutes = total / 60;
+        const long long secs = total % 60;
 
         std::ostringstream oss;
-        if (h > 0) oss << h << "h ";
-        if (h > 0 || m > 0) oss << m << "m ";
-        oss << s << "s";
+        if (hours > 0) {
+            oss << hours << "h ";
+        }
+        if (hours > 0 || minutes > 0) {
+            oss << minutes << "m ";
+        }
+        oss << secs << "s";
         return oss.str();
     }
 
@@ -119,21 +95,23 @@ namespace rt {
                                     std::int64_t runs_total,
                                     tick_t ticks_done,
                                     tick_t total_ticks,
-                                    const std::chrono::steady_clock::time_point& start)
-    {
+                                    const std::chrono::steady_clock::time_point& start_time) {
         const auto now = std::chrono::steady_clock::now();
         const double elapsed =
-            std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
 
         const double progress =
-            (total_ticks > 0) ? (100.0 * static_cast<double>(ticks_done) / static_cast<double>(total_ticks))
-                              : 100.0;
+            (total_ticks > 0)
+                ? (100.0 * static_cast<double>(ticks_done) / static_cast<double>(total_ticks))
+                : 100.0;
 
         const double tick_rate =
             (elapsed > 0.0) ? (static_cast<double>(ticks_done) / elapsed) : 0.0;
 
         const double eta =
-            (tick_rate > 0.0) ? (static_cast<double>(total_ticks - ticks_done) / tick_rate) : 0.0;
+            (tick_rate > 0.0)
+                ? (static_cast<double>(total_ticks - ticks_done) / tick_rate)
+                : 0.0;
 
         std::cout << "\r[Batch] "
                   << runs_done << "/" << runs_total
@@ -144,12 +122,11 @@ namespace rt {
                   << std::flush;
     }
 
-    public:
+public:
     static void run(const std::vector<std::vector<Task>>& tasksets,
                     const BatchConfig& cfg,
                     const std::string& summary_csv_path,
-                    const std::string& per_task_csv_path)
-    {
+                    const std::string& per_task_csv_path) {
         if (tasksets.empty()) {
             std::cout << "[Batch] No task sets to run.\n";
             return;
@@ -164,7 +141,7 @@ namespace rt {
         }
 
         tick_t ticks_done = 0;
-        const auto start = std::chrono::steady_clock::now();
+        const auto start_time = std::chrono::steady_clock::now();
 
         for (std::int64_t run_id = 0; run_id < static_cast<std::int64_t>(tasksets.size()); ++run_id) {
             const auto& tasks = tasksets[run_id];
@@ -181,8 +158,9 @@ namespace rt {
             ticks_done += horizon;
 
             if (cfg.print_progress) {
+                const std::size_t step = std::max<std::size_t>(1, cfg.progress_every_runs);
                 const bool must_print =
-                    ((run_id + 1) % static_cast<std::int64_t>(std::max<std::size_t>(1, cfg.progress_every_runs)) == 0) ||
+                    (((run_id + 1) % static_cast<std::int64_t>(step)) == 0) ||
                     (run_id + 1 == static_cast<std::int64_t>(tasksets.size()));
 
                 if (must_print) {
@@ -190,7 +168,7 @@ namespace rt {
                                         static_cast<std::int64_t>(tasksets.size()),
                                         ticks_done,
                                         total_ticks,
-                                        start);
+                                        start_time);
                 }
             }
         }
@@ -199,6 +177,6 @@ namespace rt {
             std::cout << "\n[Batch] Completed.\n";
         }
     }
+};
 
 } // namespace rt
-
