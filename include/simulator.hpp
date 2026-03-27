@@ -27,7 +27,7 @@ public:
         metrics_.init_from_tasks(tasks_, horizon_);
     }
 
-    void run(bool debug_timeline = false, bool print_input = true) {
+    void run(bool debug_timeline = false, bool print_input = true, bool print_summary = true) {
         reset();
 
         if (print_input) {
@@ -56,7 +56,6 @@ public:
                 running.execute_one_tick(t);
                 metrics_.busy_ticks++;
 
-                // Se ha finito ora, aggiorna metriche per-task
                 if (running.finish_time.has_value()) {
                     metrics_.per_task[running.task_index].on_job_completed(running);
                 }
@@ -71,7 +70,6 @@ public:
             }
         }
 
-        // Debug: stampa job non completati entro l'horizon
         if (debug_timeline) {
             int count = 0;
             for (const auto& j : jobs_) {
@@ -87,11 +85,12 @@ public:
 
         metrics_.finalize();
 
-        // Risultati finali
-        metrics_.print_summary(std::cout, tasks_);
-        std::cout << "\n";
+        if (print_summary) {
+            metrics_.print_summary(std::cout, tasks_);
+            std::cout << "\n";
+        }
     }
-
+    
     const SimulationMetrics& metrics() const { return metrics_; }
 
 private:
