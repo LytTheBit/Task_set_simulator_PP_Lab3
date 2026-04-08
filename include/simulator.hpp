@@ -101,16 +101,17 @@ private:
         metrics_.init_from_tasks(tasks_, horizon_);
     }
 
+
     void print_taskset(std::ostream& os) const {
         os << "=== Task set ===\n";
         os << std::left
-           << std::setw(6)  << "Idx"
-           << std::setw(6)  << "ID"
-           << std::setw(6)  << "Prio"
-           << std::setw(6)  << "T"
-           << std::setw(6)  << "D"
-           << std::setw(6)  << "C"
-           << std::setw(6)  << "O"
+           << std::setw(6)  << "Idx" // indice del task
+           << std::setw(6)  << "ID" // identificativo del task
+           << std::setw(6)  << "Prio" // priorità del task
+           << std::setw(6)  << "T" // periodo (period)
+           << std::setw(6)  << "D" // deadline
+           << std::setw(6)  << "C" // worst-case execution time
+           << std::setw(6)  << "O" // offset (tempo di rilascio iniziale)
            << "\n";
         os << std::string(6+6+6+6+6+6+6, '-') << "\n";
 

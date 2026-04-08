@@ -1,9 +1,9 @@
 // batch_runner.hpp
 // Created by Francesco on 17/02/2026.
 //
-// Esecuzione batch (sequenziale) di più task set.
+// Esecuzione batch sequenziale e parallela di più task set.
 // Supporta horizon fisso o iperperiodo, limite massimo all'horizon,
-// export CSV e progresso sintetico con stima ETA.
+// export CSV, misura dei tempi complessivi del batch e stampa del progresso.
 
 #pragma once
 
@@ -12,10 +12,10 @@
 #include <cstdint>
 #include <iostream>
 #include <chrono>
-#include <iomanip>
-#include <sstream>
 #include <algorithm>
 #include <stdexcept>
+#include <atomic>
+#include <omp.h>
 
 #include "task.hpp"
 #include "simulator.hpp"
@@ -41,8 +41,18 @@ struct BatchConfig {
     bool print_summary_each_run = false;
     bool print_progress = true;
 
-    // Stampa il progresso ogni N run completate
-    std::size_t progress_every_runs = 1;
+    int num_threads = omp_get_max_threads();
+};
+
+struct BatchRunData {
+    std::int64_t run_id = 0;
+    std::vector<Task> tasks;
+    SimulationMetrics metrics;
+};
+
+struct BatchExecutionResult {
+    std::vector<BatchRunData> runs;
+    double elapsed_seconds = 0.0;
 };
 
 class BatchRunner {
@@ -69,113 +79,122 @@ private:
         return horizon;
     }
 
-    static std::string format_seconds(double seconds) {
-        if (seconds < 0.0) {
-            seconds = 0.0;
+    static void export_results(const BatchExecutionResult& result,
+                               const std::string& summary_csv_path,
+                               const std::string& per_task_csv_path,
+                               const std::string& policy = "FPP")
+    {
+        for (const auto& run : result.runs) {
+            append_summary_csv(summary_csv_path, run.run_id, run.tasks, run.metrics, policy);
+            append_per_task_csv(per_task_csv_path, run.run_id, run.tasks, run.metrics, policy);
         }
-
-        auto total = static_cast<long long>(seconds + 0.5);
-        const long long hours = total / 3600;
-        total %= 3600;
-        const long long minutes = total / 60;
-        const long long secs = total % 60;
-
-        std::ostringstream oss;
-        if (hours > 0) {
-            oss << hours << "h ";
-        }
-        if (hours > 0 || minutes > 0) {
-            oss << minutes << "m ";
-        }
-        oss << secs << "s";
-        return oss.str();
-    }
-
-    static void print_progress_line(std::int64_t runs_done,
-                                    std::int64_t runs_total,
-                                    tick_t ticks_done,
-                                    tick_t total_ticks,
-                                    const std::chrono::steady_clock::time_point& start_time) {
-        const auto now = std::chrono::steady_clock::now();
-        const double elapsed =
-            std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-
-        const double progress =
-            (total_ticks > 0)
-                ? (100.0 * static_cast<double>(ticks_done) / static_cast<double>(total_ticks))
-                : 100.0;
-
-        const double tick_rate =
-            (elapsed > 0.0) ? (static_cast<double>(ticks_done) / elapsed) : 0.0;
-
-        const double eta =
-            (tick_rate > 0.0)
-                ? (static_cast<double>(total_ticks - ticks_done) / tick_rate)
-                : 0.0;
-
-        std::cout << "\r[Batch] "
-                  << runs_done << "/" << runs_total
-                  << " runs"
-                  << " | ticks " << ticks_done << "/" << total_ticks
-                  << " | " << std::fixed << std::setprecision(1) << progress << "%"
-                  << " | ETA " << format_seconds(eta)
-                  << std::flush;
     }
 
 public:
-    static void run(const std::vector<std::vector<Task>>& tasksets,
-                    const BatchConfig& cfg,
-                    const std::string& summary_csv_path,
-                    const std::string& per_task_csv_path) {
-        if (tasksets.empty()) {
-            std::cout << "[Batch] No task sets to run.\n";
-            return;
-        }
+    static BatchExecutionResult run_sequential(const std::vector<std::vector<Task>>& tasksets,
+                                               const BatchConfig& cfg)
+    {
+        BatchExecutionResult result;
+        result.runs.resize(tasksets.size());
 
-        std::vector<tick_t> horizons(tasksets.size(), 0);
-        tick_t total_ticks = 0;
-
-        for (size_t i = 0; i < tasksets.size(); ++i) {
-            horizons[i] = resolve_horizon(tasksets[i], cfg);
-            total_ticks += horizons[i];
-        }
-
-        tick_t ticks_done = 0;
         const auto start_time = std::chrono::steady_clock::now();
 
         for (std::int64_t run_id = 0; run_id < static_cast<std::int64_t>(tasksets.size()); ++run_id) {
             const auto& tasks = tasksets[run_id];
-            const tick_t horizon = horizons[run_id];
+            const tick_t horizon = resolve_horizon(tasks, cfg);
 
             Simulator sim(tasks, horizon);
             sim.run(cfg.debug_timeline,
                     cfg.print_input_each_run,
                     cfg.print_summary_each_run);
 
-            append_summary_csv(summary_csv_path, run_id, tasks, sim.metrics(), "FPP");
-            append_per_task_csv(per_task_csv_path, run_id, tasks, sim.metrics(), "FPP");
-
-            ticks_done += horizon;
+            result.runs[run_id].run_id = run_id;
+            result.runs[run_id].tasks = tasks;
+            result.runs[run_id].metrics = sim.metrics();
 
             if (cfg.print_progress) {
-                const std::size_t step = std::max<std::size_t>(1, cfg.progress_every_runs);
-                const bool must_print =
-                    (((run_id + 1) % static_cast<std::int64_t>(step)) == 0) ||
-                    (run_id + 1 == static_cast<std::int64_t>(tasksets.size()));
+                std::cout << "\r[SEQ] Completed " << (run_id + 1)
+                          << "/" << tasksets.size() << std::flush;
+            }
+        }
 
-                if (must_print) {
-                    print_progress_line(run_id + 1,
-                                        static_cast<std::int64_t>(tasksets.size()),
-                                        ticks_done,
-                                        total_ticks,
-                                        start_time);
+        const auto end_time = std::chrono::steady_clock::now();
+        result.elapsed_seconds =
+            std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
+
+        if (cfg.print_progress) {
+            std::cout << "\n";
+        }
+
+        return result;
+    }
+
+    static BatchExecutionResult run_parallel(const std::vector<std::vector<Task>>& tasksets,
+                                             const BatchConfig& cfg)
+    {
+        BatchExecutionResult result;
+        result.runs.resize(tasksets.size());
+
+        const auto start_time = std::chrono::steady_clock::now();
+        std::atomic<int> completed{0};
+
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(cfg.num_threads)
+        for (int run_id = 0; run_id < static_cast<int>(tasksets.size()); ++run_id) {
+            const auto& tasks = tasksets[run_id];
+            const tick_t horizon = resolve_horizon(tasks, cfg);
+
+            Simulator sim(tasks, horizon);
+            sim.run(false, false, false);
+
+            result.runs[run_id].run_id = run_id;
+            result.runs[run_id].tasks = tasks;
+            result.runs[run_id].metrics = sim.metrics();
+
+            int done = ++completed;
+
+            if (cfg.print_progress) {
+                #pragma omp critical
+                {
+                    std::cout << "\r[PAR|" << cfg.num_threads << "-Thread] Completed "
+                              << done << "/" << tasksets.size() << std::flush;
                 }
             }
         }
 
+        const auto end_time = std::chrono::steady_clock::now();
+        result.elapsed_seconds =
+            std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
+
         if (cfg.print_progress) {
-            std::cout << "\n[Batch] Completed.\n";
+            std::cout << "\n";
         }
+
+        return result;
+    }
+
+    static void run_and_export_sequential(const std::vector<std::vector<Task>>& tasksets,
+                                          const BatchConfig& cfg,
+                                          const std::string& summary_csv_path,
+                                          const std::string& per_task_csv_path)
+    {
+        auto result = run_sequential(tasksets, cfg);
+        export_results(result, summary_csv_path, per_task_csv_path, "FPP");
+    }
+
+    static void run_and_export_parallel(const std::vector<std::vector<Task>>& tasksets,
+                                        const BatchConfig& cfg,
+                                        const std::string& summary_csv_path,
+                                        const std::string& per_task_csv_path)
+    {
+        auto result = run_parallel(tasksets, cfg);
+        export_results(result, summary_csv_path, per_task_csv_path, "FPP");
+    }
+
+    static void export_batch_result(const BatchExecutionResult& result,
+                                    const std::string& summary_csv_path,
+                                    const std::string& per_task_csv_path)
+    {
+        export_results(result, summary_csv_path, per_task_csv_path, "FPP");
     }
 };
 
