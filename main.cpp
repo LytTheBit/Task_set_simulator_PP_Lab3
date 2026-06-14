@@ -129,7 +129,7 @@ int main() {
     // Benchmark parameters
     // =========================
     const int warmup_runs = 1;
-    const int measured_runs = 3;
+    const int measured_runs = 3; // Numero di misure per ogni configurazione
 
     const std::vector<int> thread_counts = {1, 2, 4, 8, 12};
 
