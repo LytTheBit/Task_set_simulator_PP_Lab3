@@ -1,9 +1,23 @@
 // main.cpp
 // Created by Francesco on 17/02/2026.
 //
-// Entry point per confronto batch sequenziale/parallelo e scaling con OpenMP.
-// Esegue warmup e misure ripetute per ogni configurazione di thread,
-// poi esporta CSV e calcola tempo medio, deviazione standard, speedup ed efficienza.
+// Entry point per confronto batch parallelo e scaling con OpenMP.
+// Questa versione confronta diverse scheduling policy OpenMP:
+// - static
+// - guided
+//
+// I risultati precedenti erano già stati ottenuti con dynamic,1.
+// Quindi questa esecuzione permette di confrontare static/guided
+// contro i dati dynamic già disponibili.
+//
+// Per ogni scheduling policy vengono testati 1, 2, 4, 8 e 12 thread.
+// Per ogni configurazione:
+// - viene eseguito un warmup
+// - vengono eseguite più misure
+// - vengono calcolati media, deviazione standard, minimo, massimo,
+//   speedup ed efficienza
+//
+// I file CSV vengono salvati con nomi separati per evitare sovrascritture.
 
 #include <iostream>
 #include <vector>
@@ -13,11 +27,13 @@
 #include <numeric>
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 #include "include/batch_runner.hpp"
 #include "include/taskset_generator.hpp"
 
 struct ScalingResult {
+    std::string schedule_name = "unknown";
     int threads = 1;
     double mean_time = 0.0;
     double stddev_time = 0.0;
@@ -25,6 +41,12 @@ struct ScalingResult {
     double max_time = 0.0;
     double speedup = 1.0;
     double efficiency = 1.0;
+};
+
+struct ScheduleConfig {
+    rt::OpenMPSchedule schedule = rt::OpenMPSchedule::Dynamic;
+    std::string name = "dynamic";
+    int chunk_size = 1;
 };
 
 double mean(const std::vector<double>& values) {
@@ -37,11 +59,63 @@ double stddev(const std::vector<double>& values, double avg) {
 
     double acc = 0.0;
     for (double v : values) {
-        double diff = v - avg;
+        const double diff = v - avg;
         acc += diff * diff;
     }
 
     return std::sqrt(acc / static_cast<double>(values.size() - 1));
+}
+
+void write_scaling_csv(const std::string& path,
+                       const std::vector<ScalingResult>& results)
+{
+    std::ofstream out(path);
+
+    out << "schedule,threads,mean_time_seconds,stddev_time_seconds,"
+        << "min_time_seconds,max_time_seconds,speedup,efficiency\n";
+
+    for (const auto& r : results) {
+        out << r.schedule_name << ","
+            << r.threads << ","
+            << std::fixed << std::setprecision(6) << r.mean_time << ","
+            << std::fixed << std::setprecision(6) << r.stddev_time << ","
+            << std::fixed << std::setprecision(6) << r.min_time << ","
+            << std::fixed << std::setprecision(6) << r.max_time << ","
+            << std::fixed << std::setprecision(6) << r.speedup << ","
+            << std::fixed << std::setprecision(6) << r.efficiency << "\n";
+    }
+}
+
+void print_scaling_table(const std::string& title,
+                         const std::vector<ScalingResult>& results)
+{
+    std::cout << "\n===== " << title << " =====\n";
+
+    std::cout << std::left
+              << std::setw(12) << "Schedule"
+              << std::setw(10) << "Threads"
+              << std::setw(18) << "Mean (s)"
+              << std::setw(18) << "StdDev (s)"
+              << std::setw(18) << "Min (s)"
+              << std::setw(18) << "Max (s)"
+              << std::setw(14) << "Speedup"
+              << std::setw(14) << "Efficiency"
+              << "\n";
+
+    std::cout << std::string(122, '-') << "\n";
+
+    for (const auto& r : results) {
+        std::cout << std::left
+                  << std::setw(12) << r.schedule_name
+                  << std::setw(10) << r.threads
+                  << std::setw(18) << std::fixed << std::setprecision(3) << r.mean_time
+                  << std::setw(18) << std::fixed << std::setprecision(3) << r.stddev_time
+                  << std::setw(18) << std::fixed << std::setprecision(3) << r.min_time
+                  << std::setw(18) << std::fixed << std::setprecision(3) << r.max_time
+                  << std::setw(14) << std::fixed << std::setprecision(3) << r.speedup
+                  << std::setw(14) << std::fixed << std::setprecision(3) << r.efficiency
+                  << "\n";
+    }
 }
 
 int main() {
@@ -51,32 +125,60 @@ int main() {
         std::filesystem::path(PROJECT_ROOT_DIR) / "results";
     std::filesystem::create_directories(out_dir);
 
-    const std::string summary_seq_csv = (out_dir / "summary_seq.csv").string();
-    const std::string per_task_seq_csv = (out_dir / "per_task_seq.csv").string();
-
-    const std::string summary_par_csv = (out_dir / "summary_par.csv").string();
-    const std::string per_task_par_csv = (out_dir / "per_task_par.csv").string();
-
-    const std::string scaling_csv = (out_dir / "scaling.csv").string();
-
-    std::filesystem::remove(summary_seq_csv);
-    std::filesystem::remove(per_task_seq_csv);
-    std::filesystem::remove(summary_par_csv);
-    std::filesystem::remove(per_task_par_csv);
-    std::filesystem::remove(scaling_csv);
-
     // =========================
     // Benchmark parameters
     // =========================
     const int warmup_runs = 1;
     const int measured_runs = 3;
 
-    // Nota: per un test veloce puoi usare {1, 4, 12}
-    std::vector<int> thread_counts = {1, 2, 4, 8, 12};
+    const std::vector<int> thread_counts = {1, 2, 4, 8, 12};
+
+    // I risultati precedenti erano dynamic,1.
+    // Qui testiamo solo static e guided, salvando file separati.
+    const std::vector<ScheduleConfig> schedules = {
+        {rt::OpenMPSchedule::Static, "static", 1},
+        {rt::OpenMPSchedule::Guided, "guided", 1}
+    };
+
+    // =========================
+    // Output files
+    // =========================
+    const std::string scaling_all_csv =
+        (out_dir / "scaling_static_guided.csv").string();
+
+    const std::string scaling_static_csv =
+        (out_dir / "scaling_static.csv").string();
+
+    const std::string scaling_guided_csv =
+        (out_dir / "scaling_guided.csv").string();
+
+    const std::string summary_static_csv =
+        (out_dir / "summary_static_12t.csv").string();
+
+    const std::string per_task_static_csv =
+        (out_dir / "per_task_static_12t.csv").string();
+
+    const std::string summary_guided_csv =
+        (out_dir / "summary_guided_12t.csv").string();
+
+    const std::string per_task_guided_csv =
+        (out_dir / "per_task_guided_12t.csv").string();
+
+    std::filesystem::remove(scaling_all_csv);
+    std::filesystem::remove(scaling_static_csv);
+    std::filesystem::remove(scaling_guided_csv);
+
+    std::filesystem::remove(summary_static_csv);
+    std::filesystem::remove(per_task_static_csv);
+    std::filesystem::remove(summary_guided_csv);
+    std::filesystem::remove(per_task_guided_csv);
 
     // =========================
     // Generazione task set
     // =========================
+    // I task set sono generati una sola volta e riutilizzati per tutte le
+    // configurazioni. In questo modo static e guided vengono confrontati
+    // sullo stesso identico workload.
     std::vector<std::vector<Task>> tasksets;
     tasksets.reserve(200);
 
@@ -102,125 +204,141 @@ int main() {
     cfg.print_summary_each_run = false;
     cfg.print_progress = true;
 
-    std::vector<ScalingResult> scaling_results;
-    scaling_results.reserve(thread_counts.size());
+    std::vector<ScalingResult> all_results;
+    all_results.reserve(schedules.size() * thread_counts.size());
 
-    double baseline_time = 0.0;
+    std::vector<ScalingResult> static_results;
+    std::vector<ScalingResult> guided_results;
+
+    static_results.reserve(thread_counts.size());
+    guided_results.reserve(thread_counts.size());
 
     // =========================
-    // Scaling OpenMP
+    // Scaling OpenMP per schedule
     // =========================
-    for (int threads : thread_counts) {
-        BatchConfig par_cfg = cfg;
-        par_cfg.num_threads = threads;
+    for (const auto& schedule_cfg : schedules) {
+        std::vector<ScalingResult> current_schedule_results;
+        current_schedule_results.reserve(thread_counts.size());
 
-        std::cout << "\n========================================\n";
-        std::cout << "Running OpenMP batch with " << threads << " thread(s)\n";
-        std::cout << "Warmup runs: " << warmup_runs << "\n";
-        std::cout << "Measured runs: " << measured_runs << "\n";
-        std::cout << "========================================\n";
+        double baseline_time = 0.0;
 
-        // Warmup: eseguiti ma non usati nelle statistiche
-        for (int w = 0; w < warmup_runs; ++w) {
-            std::cout << "Warmup " << (w + 1) << "/" << warmup_runs << "\n";
-            auto warmup_result = BatchRunner::run_parallel(tasksets, par_cfg);
-            (void) warmup_result;
+        for (int threads : thread_counts) {
+            BatchConfig par_cfg = cfg;
+            par_cfg.num_threads = threads;
+            par_cfg.omp_schedule = schedule_cfg.schedule;
+            par_cfg.omp_chunk_size = schedule_cfg.chunk_size;
+
+            std::cout << "\n========================================\n";
+            std::cout << "Running OpenMP batch\n";
+            std::cout << "Schedule: " << schedule_cfg.name << "\n";
+            std::cout << "Threads: " << threads << "\n";
+            std::cout << "Chunk size: " << schedule_cfg.chunk_size << "\n";
+            std::cout << "Warmup runs: " << warmup_runs << "\n";
+            std::cout << "Measured runs: " << measured_runs << "\n";
+            std::cout << "========================================\n";
+
+            // Warmup: eseguito ma non usato nelle statistiche.
+            for (int w = 0; w < warmup_runs; ++w) {
+                std::cout << "Warmup " << (w + 1) << "/" << warmup_runs << "\n";
+                auto warmup_result = BatchRunner::run_parallel(tasksets, par_cfg);
+                (void) warmup_result;
+            }
+
+            std::vector<double> times;
+            times.reserve(measured_runs);
+
+            BatchExecutionResult last_result;
+
+            for (int r = 0; r < measured_runs; ++r) {
+                std::cout << "Measured run " << (r + 1) << "/" << measured_runs << "\n";
+
+                auto result = BatchRunner::run_parallel(tasksets, par_cfg);
+                times.push_back(result.elapsed_seconds);
+
+                // Conserviamo l'ultima run per esportare i CSV della
+                // configurazione finale a 12 thread.
+                last_result = std::move(result);
+            }
+
+            const double avg = mean(times);
+            const double sd = stddev(times, avg);
+            const double min_t = *std::min_element(times.begin(), times.end());
+            const double max_t = *std::max_element(times.begin(), times.end());
+
+            // La baseline per ogni schedule è la sua esecuzione a 1 thread.
+            // Questo permette di calcolare lo scaling interno di static e guided
+            // separatamente.
+            if (threads == 1) {
+                baseline_time = avg;
+            }
+
+            ScalingResult sr;
+            sr.schedule_name = schedule_cfg.name;
+            sr.threads = threads;
+            sr.mean_time = avg;
+            sr.stddev_time = sd;
+            sr.min_time = min_t;
+            sr.max_time = max_t;
+            sr.speedup = baseline_time / avg;
+            sr.efficiency = sr.speedup / static_cast<double>(threads);
+
+            current_schedule_results.push_back(sr);
+            all_results.push_back(sr);
+
+            // Esporta i risultati completi solo per 12 thread.
+            // In questo modo puoi verificare che static/guided producano
+            // gli stessi risultati logici della versione dynamic.
+            if (threads == 12) {
+                if (schedule_cfg.name == "static") {
+                    BatchRunner::export_batch_result(
+                        last_result,
+                        summary_static_csv,
+                        per_task_static_csv
+                    );
+                } else if (schedule_cfg.name == "guided") {
+                    BatchRunner::export_batch_result(
+                        last_result,
+                        summary_guided_csv,
+                        per_task_guided_csv
+                    );
+                }
+            }
         }
 
-        std::vector<double> times;
-        times.reserve(measured_runs);
-
-        BatchExecutionResult last_result;
-
-        for (int r = 0; r < measured_runs; ++r) {
-            std::cout << "Measured run " << (r + 1) << "/" << measured_runs << "\n";
-            auto result = BatchRunner::run_parallel(tasksets, par_cfg);
-
-            times.push_back(result.elapsed_seconds);
-            last_result = std::move(result);
-        }
-
-        const double avg = mean(times);
-        const double sd = stddev(times, avg);
-        const double min_t = *std::min_element(times.begin(), times.end());
-        const double max_t = *std::max_element(times.begin(), times.end());
-
-        if (threads == 1) {
-            baseline_time = avg;
-
-            // Esporta anche la baseline a 1 thread come riferimento sequenziale/OpenMP-1T
-            BatchRunner::export_batch_result(last_result, summary_seq_csv, per_task_seq_csv);
-        }
-
-        ScalingResult sr;
-        sr.threads = threads;
-        sr.mean_time = avg;
-        sr.stddev_time = sd;
-        sr.min_time = min_t;
-        sr.max_time = max_t;
-        sr.speedup = baseline_time / avg;
-        sr.efficiency = sr.speedup / static_cast<double>(threads);
-
-        scaling_results.push_back(sr);
-
-        // Esporta i CSV completi solo per la configurazione finale a 12 thread
-        if (threads == 12) {
-            BatchRunner::export_batch_result(last_result, summary_par_csv, per_task_par_csv);
-        }
-    }
-
-    // =========================
-    // Stampa tabella finale
-    // =========================
-    std::cout << "\n===== Scaling results =====\n";
-    std::cout << std::left
-              << std::setw(10) << "Threads"
-              << std::setw(18) << "Mean (s)"
-              << std::setw(18) << "StdDev (s)"
-              << std::setw(18) << "Min (s)"
-              << std::setw(18) << "Max (s)"
-              << std::setw(14) << "Speedup"
-              << std::setw(14) << "Efficiency"
-              << "\n";
-
-    std::cout << std::string(110, '-') << "\n";
-
-    for (const auto& r : scaling_results) {
-        std::cout << std::left
-                  << std::setw(10) << r.threads
-                  << std::setw(18) << std::fixed << std::setprecision(3) << r.mean_time
-                  << std::setw(18) << std::fixed << std::setprecision(3) << r.stddev_time
-                  << std::setw(18) << std::fixed << std::setprecision(3) << r.min_time
-                  << std::setw(18) << std::fixed << std::setprecision(3) << r.max_time
-                  << std::setw(14) << std::fixed << std::setprecision(3) << r.speedup
-                  << std::setw(14) << std::fixed << std::setprecision(3) << r.efficiency
-                  << "\n";
-    }
-
-    // =========================
-    // Salvataggio scaling.csv
-    // =========================
-    {
-        std::ofstream out(scaling_csv);
-        out << "threads,mean_time_seconds,stddev_time_seconds,min_time_seconds,max_time_seconds,speedup,efficiency\n";
-
-        for (const auto& r : scaling_results) {
-            out << r.threads << ","
-                << std::fixed << std::setprecision(6) << r.mean_time << ","
-                << std::fixed << std::setprecision(6) << r.stddev_time << ","
-                << std::fixed << std::setprecision(6) << r.min_time << ","
-                << std::fixed << std::setprecision(6) << r.max_time << ","
-                << std::fixed << std::setprecision(6) << r.speedup << ","
-                << std::fixed << std::setprecision(6) << r.efficiency << "\n";
+        if (schedule_cfg.name == "static") {
+            static_results = current_schedule_results;
+        } else if (schedule_cfg.name == "guided") {
+            guided_results = current_schedule_results;
         }
     }
+
+    // =========================
+    // Stampa tabelle finali
+    // =========================
+    print_scaling_table("Static schedule results", static_results);
+    print_scaling_table("Guided schedule results", guided_results);
+    print_scaling_table("All static/guided results", all_results);
+
+    // =========================
+    // Salvataggio CSV
+    // =========================
+    write_scaling_csv(scaling_static_csv, static_results);
+    write_scaling_csv(scaling_guided_csv, guided_results);
+    write_scaling_csv(scaling_all_csv, all_results);
 
     std::cout << "\nGenerated files:\n";
-    std::cout << "  - " << summary_seq_csv << "\n";
-    std::cout << "  - " << per_task_seq_csv << "\n";
-    std::cout << "  - " << summary_par_csv << "\n";
-    std::cout << "  - " << per_task_par_csv << "\n";
-    std::cout << "  - " << scaling_csv << "\n";
+    std::cout << "  - " << scaling_static_csv << "\n";
+    std::cout << "  - " << scaling_guided_csv << "\n";
+    std::cout << "  - " << scaling_all_csv << "\n";
+    std::cout << "  - " << summary_static_csv << "\n";
+    std::cout << "  - " << per_task_static_csv << "\n";
+    std::cout << "  - " << summary_guided_csv << "\n";
+    std::cout << "  - " << per_task_guided_csv << "\n";
+
+    std::cout << "\nNote:\n";
+    std::cout << "  Previous scaling.csv results correspond to dynamic,1.\n";
+    std::cout << "  This run measures static and guided with 1, 2, 4, 8, 12 threads.\n";
+    std::cout << "  Compare scaling_static_guided.csv with the previous scaling.csv.\n";
 
     return 0;
-}  
+}

@@ -4,6 +4,13 @@
 // Esecuzione batch sequenziale e parallela di più task set.
 // Supporta horizon fisso o iperperiodo, limite massimo all'horizon,
 // export CSV, misura dei tempi complessivi del batch e stampa del progresso.
+//
+// Ottimizzazioni applicate:
+// 1. OpenMP schedule configurabile a runtime: static, dynamic, guided.
+// 2. Evita copie inutili dei task set nei risultati batch.
+//    Ogni BatchRunData mantiene un puntatore costante al task set originale.
+// 3. CSV export eseguito dopo il batch, fuori dalla regione parallela,
+//    per evitare race condition su file.
 
 #pragma once
 
@@ -29,11 +36,21 @@ enum class HorizonMode {
     Hyperperiod
 };
 
+// Schedule OpenMP usata per distribuire i task set tra i thread.
+// Attenzione: questa NON è la politica real-time del simulatore.
+// La politica real-time resta FPP/RM. Questa scelta riguarda solo
+// la distribuzione del batch tra i thread OpenMP.
+enum class OpenMPSchedule {
+    Static,
+    Dynamic,
+    Guided
+};
+
 struct BatchConfig {
     HorizonMode horizon_mode = HorizonMode::Fixed;
     tick_t fixed_horizon = 1000;
 
-    // 0 = nessun limite; se > 0 limita l'horizon massimo
+    // 0 = nessun limite; se > 0 limita l'horizon massimo.
     tick_t max_horizon = 0;
 
     bool debug_timeline = false;
@@ -42,11 +59,25 @@ struct BatchConfig {
     bool print_progress = true;
 
     int num_threads = omp_get_max_threads();
+
+    // Schedule OpenMP configurabile.
+    // Dynamic con chunk 1 è una buona scelta di default perché i task set
+    // possono avere costi diversi.
+    OpenMPSchedule omp_schedule = OpenMPSchedule::Dynamic;
+    int omp_chunk_size = 1;
 };
 
 struct BatchRunData {
     std::int64_t run_id = 0;
-    std::vector<Task> tasks;
+
+    // Puntatore al task set originale.
+    // Evita di copiare std::vector<Task> per ogni run.
+    //
+    // Vincolo importante:
+    // il vettore tasksets passato a run_sequential/run_parallel deve rimanere
+    // vivo fino alla fine dell'export CSV.
+    const std::vector<Task>* tasks = nullptr;
+
     SimulationMetrics metrics;
 };
 
@@ -79,14 +110,51 @@ private:
         return horizon;
     }
 
+    static void configure_omp_schedule(const BatchConfig& cfg) {
+        const int chunk_size = std::max(1, cfg.omp_chunk_size);
+
+        switch (cfg.omp_schedule) {
+            case OpenMPSchedule::Static:
+                omp_set_schedule(omp_sched_static, chunk_size);
+                break;
+
+            case OpenMPSchedule::Dynamic:
+                omp_set_schedule(omp_sched_dynamic, chunk_size);
+                break;
+
+            case OpenMPSchedule::Guided:
+                omp_set_schedule(omp_sched_guided, chunk_size);
+                break;
+        }
+    }
+
+    static const char* schedule_name(OpenMPSchedule schedule) {
+        switch (schedule) {
+            case OpenMPSchedule::Static:
+                return "static";
+
+            case OpenMPSchedule::Dynamic:
+                return "dynamic";
+
+            case OpenMPSchedule::Guided:
+                return "guided";
+        }
+
+        return "unknown";
+    }
+
     static void export_results(const BatchExecutionResult& result,
                                const std::string& summary_csv_path,
                                const std::string& per_task_csv_path,
                                const std::string& policy = "FPP")
     {
         for (const auto& run : result.runs) {
-            append_summary_csv(summary_csv_path, run.run_id, run.tasks, run.metrics, policy);
-            append_per_task_csv(per_task_csv_path, run.run_id, run.tasks, run.metrics, policy);
+            if (run.tasks == nullptr) {
+                throw std::runtime_error("BatchRunData contains a null task-set pointer");
+            }
+
+            append_summary_csv(summary_csv_path, run.run_id, *run.tasks, run.metrics, policy);
+            append_per_task_csv(per_task_csv_path, run.run_id, *run.tasks, run.metrics, policy);
         }
     }
 
@@ -109,7 +177,11 @@ public:
                     cfg.print_summary_each_run);
 
             result.runs[run_id].run_id = run_id;
-            result.runs[run_id].tasks = tasks;
+
+            // Non copiamo il task set: salviamo solo un riferimento stabile
+            // al task set originale dentro tasksets.
+            result.runs[run_id].tasks = &tasks;
+
             result.runs[run_id].metrics = sim.metrics();
 
             if (cfg.print_progress) {
@@ -135,27 +207,41 @@ public:
         BatchExecutionResult result;
         result.runs.resize(tasksets.size());
 
+        configure_omp_schedule(cfg);
+
         const auto start_time = std::chrono::steady_clock::now();
         std::atomic<int> completed{0};
 
-        #pragma omp parallel for schedule(dynamic, 1) num_threads(cfg.num_threads)
+        // schedule(runtime) usa la policy impostata da configure_omp_schedule().
+        // In questo modo static/dynamic/guided possono essere testate dal main
+        // senza cambiare questa pragma e senza ricompilare versioni diverse.
+        #pragma omp parallel for schedule(runtime) num_threads(cfg.num_threads)
         for (int run_id = 0; run_id < static_cast<int>(tasksets.size()); ++run_id) {
             const auto& tasks = tasksets[run_id];
             const tick_t horizon = resolve_horizon(tasks, cfg);
 
+            // Ogni thread crea un Simulator locale.
+            // Lo stato della simulazione non è condiviso tra thread.
             Simulator sim(tasks, horizon);
             sim.run(false, false, false);
 
             result.runs[run_id].run_id = run_id;
-            result.runs[run_id].tasks = tasks;
+
+            // Nessuna copia del task set.
+            // Ogni run punta al proprio task set originale.
+            result.runs[run_id].tasks = &tasks;
+
+            // Ogni thread scrive in una posizione diversa del vettore result.runs.
+            // Quindi non c'è race condition sui risultati.
             result.runs[run_id].metrics = sim.metrics();
 
-            int done = ++completed;
+            const int done = ++completed;
 
             if (cfg.print_progress) {
                 #pragma omp critical
                 {
-                    std::cout << "\r[PAR|" << cfg.num_threads << "-Thread] Completed "
+                    std::cout << "\r[PAR|" << cfg.num_threads << "-Thread|"
+                              << schedule_name(cfg.omp_schedule) << "] Completed "
                               << done << "/" << tasksets.size() << std::flush;
                 }
             }
